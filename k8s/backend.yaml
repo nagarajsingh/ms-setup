@@ -25,6 +25,8 @@ spec:
         app: ms-setup-backend
     spec:
       serviceAccountName: az-devops-deployment
+      imagePullSecrets:
+        - name: docker-secret
       containers:
         - name: backend
           image: mashrequae.azurecr.io/ms-setup-backend:latest
