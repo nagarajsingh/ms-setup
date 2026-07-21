@@ -1,0 +1,30 @@
+services:
+  ms-setup-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ms-setup-portal
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      JWT_SECRET: "${JWT_SECRET:-local-development-secret-change-me}"
+      DEVOPS_APPROVER_PASSWORD: "${DEVOPS_APPROVER_PASSWORD:-devops123}"
+      DATA_FILE: "/app/data/requests.json"
+      PROVISION_MODE: "${PROVISION_MODE:-dry-run}"
+      AZDO_ORG: "${AZDO_ORG:-}"
+      AZDO_PROJECT: "${AZDO_PROJECT:-}"
+      AZDO_PAT: "${AZDO_PAT:-}"
+      KUBECONFIG: "${KUBECONFIG:-}"
+    volumes:
+      - ms-setup-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ms-setup-data:
