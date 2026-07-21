@@ -13,21 +13,38 @@ spec:
       labels:
         app: ms-setup-frontend
     spec:
+      imagePullSecrets:
+        - name: docker-secret
       containers:
         - name: frontend
           image: mashrequae.azurecr.io/ms-setup-frontend:latest
           imagePullPolicy: Always
           ports:
-            - containerPort: 8080
+            - name: http
+              containerPort: 8080
           readinessProbe:
-            httpGet: {path: /, port: 8080}
+            httpGet:
+              path: /
+              port: http
             initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           livenessProbe:
-            httpGet: {path: /, port: 8080}
+            httpGet:
+              path: /
+              port: http
             initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
-            requests: {cpu: 50m, memory: 64Mi}
-            limits: {cpu: 200m, memory: 256Mi}
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
 ---
 apiVersion: v1
 kind: Service
@@ -40,4 +57,5 @@ spec:
   ports:
     - name: http
       port: 8080
-      targetPort: 8080
+      targetPort: http
+  type: ClusterIP
