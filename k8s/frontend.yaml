@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ms-setup-frontend
-  namespace: default
+  namespace: automation
 spec:
   replicas: 1
   selector:
@@ -50,12 +50,12 @@ apiVersion: v1
 kind: Service
 metadata:
   name: ms-setup-frontend
-  namespace: default
+  namespace: automation
 spec:
+  type: ClusterIP
   selector:
     app: ms-setup-frontend
   ports:
     - name: http
       port: 8080
       targetPort: http
-  type: ClusterIP
