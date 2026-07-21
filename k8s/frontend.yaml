@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ms-setup-frontend
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ms-setup-frontend
+  template:
+    metadata:
+      labels:
+        app: ms-setup-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: mashrequae.azurecr.io/ms-setup-frontend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: {path: /, port: 8080}
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: {path: /, port: 8080}
+            initialDelaySeconds: 15
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ms-setup-frontend
+  namespace: default
+spec:
+  selector:
+    app: ms-setup-frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
