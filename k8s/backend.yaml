@@ -1,19 +1,8 @@
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ms-setup-data
-  namespace: default
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: 1Gi
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ms-setup-backend
-  namespace: default
+  namespace: automation
 spec:
   replicas: 1
   selector:
@@ -32,16 +21,12 @@ spec:
           image: mashrequae.azurecr.io/ms-setup-backend:latest
           imagePullPolicy: Always
           ports:
-            - containerPort: 8000
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: ms-setup-config
           env:
-            - name: PROVISION_MODE
-              value: live
-            - name: AZDO_ORG
-              value: MashreqCorpTech
-            - name: AZDO_PROJECT
-              value: Titan
-            - name: CORS_ORIGINS
-              value: "*"
             - name: AZDO_PAT
               valueFrom:
                 secretKeyRef:
@@ -58,31 +43,46 @@ spec:
                   name: ms-setup-secret
                   key: DEVOPS_APPROVER_PASSWORD
           volumeMounts:
-            - name: data
+            - name: ms-service-storage
               mountPath: /app/data
           readinessProbe:
-            httpGet: {path: /api/health, port: 8000}
-            initialDelaySeconds: 5
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
           livenessProbe:
-            httpGet: {path: /api/health, port: 8000}
-            initialDelaySeconds: 15
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
-            requests: {cpu: 100m, memory: 128Mi}
-            limits: {cpu: 500m, memory: 512Mi}
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
       volumes:
-        - name: data
+        - name: ms-service-storage
           persistentVolumeClaim:
-            claimName: ms-setup-data
+            claimName: ms-service-pvc
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: ms-setup-backend
-  namespace: default
+  namespace: automation
 spec:
+  type: ClusterIP
   selector:
     app: ms-setup-backend
   ports:
     - name: http
       port: 8000
-      targetPort: 8000
+      targetPort: http
