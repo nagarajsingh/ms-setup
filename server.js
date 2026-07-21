@@ -42,6 +42,9 @@ function auth(req, res, next) {
 function requireRole(...roles) {
   return (req, res, next) => roles.includes(req.user.role) ? next() : res.status(403).json({ error: 'Insufficient permission' });
 }
+function errorStatus(error) {
+  return error?.response?.status || error?.statusCode || error?.status || error?.body?.code;
+}
 
 app.post('/api/login', (req, res) => {
   const { username, password, role } = req.body;
@@ -101,10 +104,20 @@ async function createAzureRepo(item) {
   if (PROVISION_MODE !== 'live') return { url: `https://dev.azure.com/example/project/_git/${item.serviceName}`, dryRun: true };
   const org = process.env.AZDO_ORG; const project = process.env.AZDO_PROJECT; const pat = process.env.AZDO_PAT;
   if (!org || !project || !pat) throw new Error('AZDO_ORG, AZDO_PROJECT and AZDO_PAT are required');
-  const response = await axios.post(`https://dev.azure.com/${org}/${project}/_apis/git/repositories?api-version=7.1`, { name: item.serviceName }, {
-    auth: { username: 'portal', password: pat }, headers: { 'Content-Type': 'application/json' }
-  });
-  return { url: response.data.webUrl || response.data.remoteUrl, id: response.data.id };
+  const baseUrl = `https://dev.azure.com/${org}/${project}/_apis/git/repositories`;
+  const config = { auth: { username: 'portal', password: pat }, headers: { 'Content-Type': 'application/json' } };
+  try {
+    const response = await axios.post(`${baseUrl}?api-version=7.1`, { name: item.serviceName }, config);
+    return { url: response.data.webUrl || response.data.remoteUrl, id: response.data.id, action: 'CREATED' };
+  } catch (error) {
+    if (errorStatus(error) !== 409) throw error;
+    const existing = await axios.get(`${baseUrl}/${encodeURIComponent(item.serviceName)}?api-version=7.1`, config);
+    return {
+      url: existing.data.webUrl || existing.data.remoteUrl || `https://dev.azure.com/${org}/${project}/_git/${item.serviceName}`,
+      id: existing.data.id,
+      action: 'REUSED_EXISTING'
+    };
+  }
 }
 
 async function createKubernetesResources(item) {
@@ -114,18 +127,50 @@ async function createKubernetesResources(item) {
   };
   const ingressPath = { path: `${item.ingressPath}(/|$)(.*)`, pathType: 'ImplementationSpecific', backend: { service: { name: item.serviceName, port: { number: item.servicePort } } } };
   if (PROVISION_MODE !== 'live') return { service, ingressPath, dryRun: true };
-  const kc = new k8s.KubeConfig(); process.env.KUBECONFIG ? kc.loadFromFile(process.env.KUBECONFIG) : kc.loadFromDefault();
-  const core = kc.makeApiClient(k8s.CoreV1Api); const networking = kc.makeApiClient(k8s.NetworkingV1Api);
-  await core.createNamespacedService({ namespace: item.namespace, body: service });
+
+  const kc = new k8s.KubeConfig();
+  process.env.KUBECONFIG ? kc.loadFromFile(process.env.KUBECONFIG) : kc.loadFromDefault();
+  const core = kc.makeApiClient(k8s.CoreV1Api);
+  const networking = kc.makeApiClient(k8s.NetworkingV1Api);
+
+  let serviceAction = 'CREATED';
+  try {
+    await core.createNamespacedService({ namespace: item.namespace, body: service });
+  } catch (error) {
+    if (errorStatus(error) !== 409) throw error;
+    const existingService = await core.readNamespacedService({ name: item.serviceName, namespace: item.namespace });
+    const current = existingService.body || existingService;
+    service.metadata.resourceVersion = current.metadata.resourceVersion;
+    service.spec.clusterIP = current.spec.clusterIP;
+    service.spec.clusterIPs = current.spec.clusterIPs;
+    service.spec.ipFamilies = current.spec.ipFamilies;
+    service.spec.ipFamilyPolicy = current.spec.ipFamilyPolicy;
+    service.spec.internalTrafficPolicy = current.spec.internalTrafficPolicy;
+    await core.replaceNamespacedService({ name: item.serviceName, namespace: item.namespace, body: service });
+    serviceAction = 'UPDATED_EXISTING';
+  }
+
   const ingressResp = await networking.readNamespacedIngress({ name: item.ingressName, namespace: item.namespace });
-  const ingress = ingressResp; const rules = ingress.spec.rules || [];
+  const ingress = ingressResp.body || ingressResp;
+  const rules = ingress.spec.rules || [];
   let rule = rules.find(r => !item.ingressHost || r.host === item.ingressHost);
   if (!rule) { rule = { host: item.ingressHost || undefined, http: { paths: [] } }; rules.push(rule); }
   rule.http = rule.http || { paths: [] };
-  if (!rule.http.paths.some(p => p.path === ingressPath.path)) rule.http.paths.push(ingressPath);
-  ingress.spec.rules = rules;
-  await networking.replaceNamespacedIngress({ name: item.ingressName, namespace: item.namespace, body: ingress });
-  return { serviceName: item.serviceName, ingressName: item.ingressName, ingressPath: item.ingressPath };
+  let ingressAction = 'UNCHANGED';
+  if (!rule.http.paths.some(p => p.path === ingressPath.path)) {
+    rule.http.paths.push(ingressPath);
+    ingress.spec.rules = rules;
+    await networking.replaceNamespacedIngress({ name: item.ingressName, namespace: item.namespace, body: ingress });
+    ingressAction = 'PATH_ADDED';
+  }
+
+  return {
+    serviceName: item.serviceName,
+    serviceAction,
+    ingressName: item.ingressName,
+    ingressPath: item.ingressPath,
+    ingressAction
+  };
 }
 
 app.post('/api/requests/:id/approve', auth, requireRole('DEVOPS'), async (req, res) => {
@@ -141,8 +186,9 @@ app.post('/api/requests/:id/approve', auth, requireRole('DEVOPS'), async (req, r
     item.steps.push({ name: 'CREATE_K8S_SERVICE_AND_UPDATE_INGRESS', status: 'COMPLETED', details: cluster });
     item.status = PROVISION_MODE === 'live' ? 'COMPLETED' : 'DRY_RUN_COMPLETED'; item.updatedAt = new Date().toISOString(); writeRequests(all); res.json(item);
   } catch (error) {
-    item.status = 'FAILED'; item.steps.push({ name: 'PROVISIONING', status: 'FAILED', error: error.message }); item.updatedAt = new Date().toISOString(); writeRequests(all);
-    res.status(500).json({ error: error.message, request: item });
+    const details = error?.response?.data || error?.body || undefined;
+    item.status = 'FAILED'; item.steps.push({ name: 'PROVISIONING', status: 'FAILED', error: error.message, details }); item.updatedAt = new Date().toISOString(); writeRequests(all);
+    res.status(500).json({ error: error.message, details, request: item });
   }
 });
 
