@@ -43,7 +43,18 @@ function requireRole(...roles) {
   return (req, res, next) => roles.includes(req.user.role) ? next() : res.status(403).json({ error: 'Insufficient permission' });
 }
 function errorStatus(error) {
-  return error?.response?.status || error?.statusCode || error?.status || error?.body?.code;
+  const directStatus = error?.response?.status || error?.statusCode || error?.status || error?.body?.code;
+  if (directStatus) return Number(directStatus);
+
+  const candidates = [error?.body, error?.response?.data, error?.message];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (typeof candidate === 'object' && candidate.code) return Number(candidate.code);
+    const text = typeof candidate === 'string' ? candidate : JSON.stringify(candidate);
+    const codeMatch = text.match(/(?:HTTP-Code:\s*|\"code\"\s*:\s*)(\d{3})/i);
+    if (codeMatch) return Number(codeMatch[1]);
+  }
+  return undefined;
 }
 
 app.post('/api/login', (req, res) => {
@@ -133,21 +144,32 @@ async function createKubernetesResources(item) {
   const core = kc.makeApiClient(k8s.CoreV1Api);
   const networking = kc.makeApiClient(k8s.NetworkingV1Api);
 
-  let serviceAction = 'CREATED';
+  let serviceAction;
+  let currentService;
   try {
-    await core.createNamespacedService({ namespace: item.namespace, body: service });
-  } catch (error) {
-    if (errorStatus(error) !== 409) throw error;
     const existingService = await core.readNamespacedService({ name: item.serviceName, namespace: item.namespace });
-    const current = existingService.body || existingService;
-    service.metadata.resourceVersion = current.metadata.resourceVersion;
-    service.spec.clusterIP = current.spec.clusterIP;
-    service.spec.clusterIPs = current.spec.clusterIPs;
-    service.spec.ipFamilies = current.spec.ipFamilies;
-    service.spec.ipFamilyPolicy = current.spec.ipFamilyPolicy;
-    service.spec.internalTrafficPolicy = current.spec.internalTrafficPolicy;
+    currentService = existingService.body || existingService;
+  } catch (error) {
+    if (errorStatus(error) !== 404) throw error;
+  }
+
+  if (currentService) {
+    service.metadata.resourceVersion = currentService.metadata.resourceVersion;
+    service.spec.clusterIP = currentService.spec.clusterIP;
+    if (currentService.spec.clusterIPs) service.spec.clusterIPs = currentService.spec.clusterIPs;
+    if (currentService.spec.ipFamilies) service.spec.ipFamilies = currentService.spec.ipFamilies;
+    if (currentService.spec.ipFamilyPolicy) service.spec.ipFamilyPolicy = currentService.spec.ipFamilyPolicy;
+    if (currentService.spec.internalTrafficPolicy) service.spec.internalTrafficPolicy = currentService.spec.internalTrafficPolicy;
     await core.replaceNamespacedService({ name: item.serviceName, namespace: item.namespace, body: service });
     serviceAction = 'UPDATED_EXISTING';
+  } else {
+    try {
+      await core.createNamespacedService({ namespace: item.namespace, body: service });
+      serviceAction = 'CREATED';
+    } catch (error) {
+      if (errorStatus(error) !== 409) throw error;
+      serviceAction = 'REUSED_EXISTING';
+    }
   }
 
   const ingressResp = await networking.readNamespacedIngress({ name: item.ingressName, namespace: item.namespace });
