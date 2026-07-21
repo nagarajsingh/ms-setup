@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ms-setup-config
+  namespace: automation
+data:
+  PROVISION_MODE: "live"
+  AZDO_ORG: "MashreqCorpTech"
+  AZDO_PROJECT: "Titan"
+  CORS_ORIGINS: "*"
