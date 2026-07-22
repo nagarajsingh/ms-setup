@@ -16,7 +16,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from kubernetes import client, config
 from kubernetes.client.exceptions import ApiException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 APP_TITLE = "Microservice Setup Portal API"
 PROVISION_MODE = os.getenv("PROVISION_MODE", "dry-run").lower()
@@ -28,7 +28,7 @@ AZDO_PROJECT = os.getenv("AZDO_PROJECT", "")
 AZDO_PAT = os.getenv("AZDO_PAT", "")
 DEVOPS_PASSWORD = os.getenv("DEVOPS_APPROVER_PASSWORD", "devops123")
 
-app = FastAPI(title=APP_TITLE, version="2.0.0")
+app = FastAPI(title=APP_TITLE, version="2.1.0")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 security = HTTPBearer()
@@ -42,19 +42,42 @@ class LoginRequest(BaseModel):
 
 
 class ServiceRequestCreate(BaseModel):
-    serviceName: str
+    repoName: str
+    serviceName: str = ""
+    folders: str = "N/A"
+    storage: str = "N/A"
+    cpu: str = ""
+    memory: str = ""
+    dbDetails: str = ""
+    acls: str = "N/A"
+    certificates: str = "N/A"
+    architectureDiagram: str = ""
+    databaseUser: str = ""
+    environments: list[str] = Field(default_factory=list)
+    ingressPath: str
+    securityStage: bool = False
+    scheduledJob: bool = False
+    prodPodCount: int = Field(default=1, ge=0, le=100)
+    comments: dict[str, str] = Field(default_factory=dict)
+
     namespace: str
     description: str = ""
     containerPort: int = Field(default=8080, ge=1, le=65535)
     servicePort: int = Field(default=8080, ge=1, le=65535)
     ingressName: str
     ingressHost: str = ""
-    ingressPath: str
     databaseRequired: bool = False
     databaseType: str = ""
     databaseName: str = ""
     schemaName: str = ""
     databaseUsername: str = ""
+
+    @field_validator("environments", mode="before")
+    @classmethod
+    def normalize_environments(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value or []
 
 
 class ApprovalRequest(BaseModel):
@@ -103,6 +126,19 @@ def require_devops(user: dict[str, str] = Depends(current_user)) -> dict[str, st
     if user["role"] != "DEVOPS":
         raise HTTPException(status_code=403, detail="DevOps permission required")
     return user
+
+
+def prepare_request(body: ServiceRequestCreate) -> dict[str, Any]:
+    item = body.model_dump()
+    item["repoName"] = safe_name(body.repoName)
+    item["serviceName"] = safe_name(body.serviceName or body.repoName)
+    item["namespace"] = safe_name(body.namespace)
+    item["ingressName"] = safe_name(body.ingressName)
+    item["environments"] = [safe_name(env) for env in body.environments if safe_name(env)]
+    item["ingressPath"] = "/" + body.ingressPath.strip().lstrip("/")
+    if not item["repoName"] or not item["serviceName"] or not item["namespace"]:
+        raise HTTPException(status_code=400, detail="Valid repo name, service name and namespace are required")
+    return item
 
 
 async def create_or_get_repo(name: str) -> dict[str, Any]:
@@ -213,16 +249,32 @@ def list_requests(user: dict[str, str] = Depends(current_user)) -> list[dict[str
 
 @app.post("/api/requests", status_code=status.HTTP_201_CREATED)
 def create_request(body: ServiceRequestCreate, user: dict[str, str] = Depends(current_user)) -> dict[str, Any]:
-    service_name, namespace = safe_name(body.serviceName), safe_name(body.namespace)
-    if not service_name or not namespace:
-        raise HTTPException(status_code=400, detail="Valid service name and namespace are required")
+    prepared = prepare_request(body)
     items = read_requests()
-    if any(x["serviceName"] == service_name and x["status"] not in {"REJECTED", "FAILED"} for x in items):
-        raise HTTPException(status_code=409, detail="An active request already exists for this service")
+    if any(x.get("repoName", x.get("serviceName")) == prepared["repoName"] and x["status"] not in {"REJECTED", "FAILED"} for x in items):
+        raise HTTPException(status_code=409, detail="An active request already exists for this repository")
     created = now_iso()
-    item = body.model_dump()
-    item.update({"id": str(uuid4()), "serviceName": service_name, "namespace": namespace, "ingressName": safe_name(body.ingressName), "status": "PENDING_APPROVAL", "requestedBy": user["username"], "approvedBy": None, "approvalComment": "", "repositoryUrl": "", "steps": [], "createdAt": created, "updatedAt": created})
-    items.insert(0, item)
+    prepared.update({"id": str(uuid4()), "status": "PENDING_APPROVAL", "requestedBy": user["username"], "approvedBy": None, "lastEditedBy": None, "approvalComment": "", "repositoryUrl": "", "steps": [], "createdAt": created, "updatedAt": created})
+    items.insert(0, prepared)
+    write_requests(items)
+    return prepared
+
+
+@app.put("/api/requests/{request_id}")
+def update_request(request_id: str, body: ServiceRequestCreate, user: dict[str, str] = Depends(require_devops)) -> dict[str, Any]:
+    items = read_requests()
+    item = next((x for x in items if x["id"] == request_id), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if item["status"] not in {"PENDING_APPROVAL", "FAILED"}:
+        raise HTTPException(status_code=409, detail="Only pending or failed requests can be edited")
+    prepared = prepare_request(body)
+    preserved = {key: item.get(key) for key in ("id", "status", "requestedBy", "approvedBy", "approvalComment", "repositoryUrl", "steps", "createdAt")}
+    item.clear()
+    item.update(prepared)
+    item.update(preserved)
+    item["lastEditedBy"] = user["username"]
+    item["updatedAt"] = now_iso()
     write_requests(items)
     return item
 
@@ -249,7 +301,7 @@ async def approve_request(request_id: str, body: ApprovalRequest, user: dict[str
     item.update({"status": "PROVISIONING", "approvedBy": user["username"], "approvalComment": body.comment or "Approved", "steps": [], "updatedAt": now_iso()})
     write_requests(items)
     try:
-        repo = await create_or_get_repo(item["serviceName"])
+        repo = await create_or_get_repo(item.get("repoName") or item["serviceName"])
         item["repositoryUrl"] = repo["url"]
         item["steps"].append({"name": "CREATE_AZURE_REPO", "status": "COMPLETED", "details": repo})
         write_requests(items)
