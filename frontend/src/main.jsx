@@ -3,9 +3,11 @@ import {createRoot} from 'react-dom/client';
 import {CheckCircle2, ChevronDown, ChevronUp, Edit3, GitBranch, LogOut, Plus, Save, Server, ShieldCheck, X, XCircle} from 'lucide-react';
 import './styles.css';
 
+const API_BASE = import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? '/api' : '/ms-setup-backend/api');
+
 const api = async (path, options={}) => {
   const token = localStorage.getItem('token');
-  const response = await fetch(path,{...options,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{}) ,...(options.headers||{})}});
+  const response = await fetch(`${API_BASE}${path}`,{...options,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{}) ,...(options.headers||{})}});
   const data = await response.json().catch(()=>({}));
   if(!response.ok) throw new Error(typeof data.detail==='string'?data.detail:(data.detail?.error||data.error||'Request failed'));
   return data;
@@ -86,15 +88,15 @@ function App(){
   const [login,setLogin]=useState({username:'',password:'',role:'DEVELOPER'});
   const [form,setForm]=useState({...emptyForm,comments:{}});
   const [expanded,setExpanded]=useState(null); const [editing,setEditing]=useState(null); const [editForm,setEditForm]=useState(null);
-  const load=()=>api('/api/requests').then(setItems).catch(e=>setError(e.message));
+  const load=()=>api('/requests').then(setItems).catch(e=>setError(e.message));
   useEffect(()=>{if(user) load();},[user]);
-  const signIn=async e=>{e.preventDefault();setError('');try{const r=await api('/api/login',{method:'POST',body:JSON.stringify(login)});localStorage.setItem('token',r.token);localStorage.setItem('user',JSON.stringify(r.user));setUser(r.user);}catch(e){setError(e.message)}};
+  const signIn=async e=>{e.preventDefault();setError('');try{const r=await api('/login',{method:'POST',body:JSON.stringify(login)});localStorage.setItem('token',r.token);localStorage.setItem('user',JSON.stringify(r.user));setUser(r.user);}catch(e){setError(e.message)}};
   const logout=()=>{localStorage.clear();setUser(null);setItems([])};
   const payload = data=>({...data,environments:Array.isArray(data.environments)?data.environments:data.environments.split(',').map(x=>x.trim()).filter(Boolean),serviceName:data.serviceName||data.repoName,databaseRequired:Boolean(data.dbDetails&&data.dbDetails.toLowerCase()!=='na')});
-  const submit=async e=>{e.preventDefault();setBusy(true);setError('');try{const body=payload(form);body.ingressPath=body.ingressPath.endsWith('/')?`${body.ingressPath}${body.repoName}`:body.ingressPath;await api('/api/requests',{method:'POST',body:JSON.stringify(body)});setForm({...emptyForm,comments:{}});await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
-  const saveEdit=async e=>{e.preventDefault();setBusy(true);setError('');try{await api(`/api/requests/${editing}`,{method:'PUT',body:JSON.stringify(payload(editForm))});setEditing(null);setEditForm(null);await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
+  const submit=async e=>{e.preventDefault();setBusy(true);setError('');try{const body=payload(form);body.ingressPath=body.ingressPath.endsWith('/')?`${body.ingressPath}${body.repoName}`:body.ingressPath;await api('/requests',{method:'POST',body:JSON.stringify(body)});setForm({...emptyForm,comments:{}});await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
+  const saveEdit=async e=>{e.preventDefault();setBusy(true);setError('');try{await api(`/requests/${editing}`,{method:'PUT',body:JSON.stringify(payload(editForm))});setEditing(null);setEditForm(null);await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
   const beginEdit=item=>{setEditing(item.id);setEditForm({...emptyForm,...item,environments:Array.isArray(item.environments)?item.environments.join(', '):(item.environments||''),comments:item.comments||{}})};
-  const act=async(id,kind)=>{setBusy(true);setError('');try{await api(`/api/requests/${id}/${kind}`,{method:'POST',body:JSON.stringify({comment:kind==='approve'?'Approved by DevOps':'Rejected by DevOps'})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
+  const act=async(id,kind)=>{setBusy(true);setError('');try{await api(`/requests/${id}/${kind}`,{method:'POST',body:JSON.stringify({comment:kind==='approve'?'Approved by DevOps':'Rejected by DevOps'})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
   const requestCount=useMemo(()=>items.length,[items]);
 
   if(!user)return <main className="login"><section className="card login-card"><div className="brand"><ShieldCheck/><div><h1>MS Setup</h1><p>Microservice provisioning portal</p></div></div>{error&&<div className="error">{error}</div>}<form onSubmit={signIn}><label>Username<input value={login.username} onChange={e=>setLogin({...login,username:e.target.value})} required/></label><label>Password<input type="password" value={login.password} onChange={e=>setLogin({...login,password:e.target.value})} required/></label><label>Role<select value={login.role} onChange={e=>setLogin({...login,role:e.target.value})}><option>DEVELOPER</option><option>DEVOPS</option></select></label><button>Sign in</button></form></section></main>;
