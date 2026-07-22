@@ -3,43 +3,32 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Literal
+from typing import Any
 from uuid import uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
 from kubernetes import client, config
 from kubernetes.client.exceptions import ApiException
 from pydantic import BaseModel, Field
 
+from app.entra_auth import current_user, require_devops
+
 APP_TITLE = "Microservice Setup Portal API"
 PROVISION_MODE = os.getenv("PROVISION_MODE", "dry-run").lower()
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-production")
-JWT_ALGORITHM = "HS256"
 DATA_FILE = Path(os.getenv("DATA_FILE", "/app/data/requests.json"))
 AZDO_ORG = os.getenv("AZDO_ORG", "")
 AZDO_PROJECT = os.getenv("AZDO_PROJECT", "")
 AZDO_PAT = os.getenv("AZDO_PAT", "")
-DEVOPS_PASSWORD = os.getenv("DEVOPS_APPROVER_PASSWORD", "devops123")
 
-app = FastAPI(title=APP_TITLE, version="2.0.0")
+app = FastAPI(title=APP_TITLE, version="2.1.0")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-security = HTTPBearer()
 store_lock = Lock()
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    role: Literal["DEVELOPER", "DEVOPS"] = "DEVELOPER"
-
 
 class ServiceRequestCreate(BaseModel):
     serviceName: str
@@ -56,19 +45,15 @@ class ServiceRequestCreate(BaseModel):
     schemaName: str = ""
     databaseUsername: str = ""
 
-
 class ApprovalRequest(BaseModel):
     comment: str = "Approved"
-
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
 def safe_name(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9-]", "-", value.strip().lower())
     return re.sub(r"-+", "-", cleaned).strip("-")
-
 
 def read_requests() -> list[dict[str, Any]]:
     with store_lock:
@@ -77,33 +62,12 @@ def read_requests() -> list[dict[str, Any]]:
             DATA_FILE.write_text("[]", encoding="utf-8")
         return json.loads(DATA_FILE.read_text(encoding="utf-8"))
 
-
 def write_requests(items: list[dict[str, Any]]) -> None:
     with store_lock:
         DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
         temp = DATA_FILE.with_suffix(".tmp")
         temp.write_text(json.dumps(items, indent=2), encoding="utf-8")
         temp.replace(DATA_FILE)
-
-
-def create_token(username: str, role: str) -> str:
-    payload = {"sub": username, "role": role, "exp": datetime.now(timezone.utc) + timedelta(hours=8)}
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-
-def current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict[str, str]:
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return {"username": payload["sub"], "role": payload["role"]}
-    except (JWTError, KeyError) as exc:
-        raise HTTPException(status_code=401, detail="Authentication required") from exc
-
-
-def require_devops(user: dict[str, str] = Depends(current_user)) -> dict[str, str]:
-    if user["role"] != "DEVOPS":
-        raise HTTPException(status_code=403, detail="DevOps permission required")
-    return user
-
 
 async def create_or_get_repo(name: str) -> dict[str, Any]:
     if PROVISION_MODE != "live":
@@ -123,7 +87,6 @@ async def create_or_get_repo(name: str) -> dict[str, Any]:
         repo = existing.json()
         return {"url": repo.get("webUrl") or repo.get("remoteUrl"), "id": repo["id"], "action": "REUSED_EXISTING"}
 
-
 def k8s_clients() -> tuple[client.CoreV1Api, client.NetworkingV1Api]:
     try:
         config.load_incluster_config()
@@ -131,20 +94,14 @@ def k8s_clients() -> tuple[client.CoreV1Api, client.NetworkingV1Api]:
         config.load_kube_config()
     return client.CoreV1Api(), client.NetworkingV1Api()
 
-
 def provision_kubernetes(item: dict[str, Any]) -> dict[str, Any]:
     path_value = f"{item['ingressPath']}(/|$)(.*)"
     if PROVISION_MODE != "live":
         return {"serviceAction": "DRY_RUN", "ingressAction": "DRY_RUN", "ingressPath": path_value}
-
     core, networking = k8s_clients()
     service = client.V1Service(
         metadata=client.V1ObjectMeta(name=item["serviceName"], namespace=item["namespace"], labels={"app": item["serviceName"]}),
-        spec=client.V1ServiceSpec(
-            type="ClusterIP",
-            selector={"app": item["serviceName"]},
-            ports=[client.V1ServicePort(name="http", protocol="TCP", port=item["servicePort"], target_port=item["containerPort"])],
-        ),
+        spec=client.V1ServiceSpec(type="ClusterIP", selector={"app": item["serviceName"]}, ports=[client.V1ServicePort(name="http", protocol="TCP", port=item["servicePort"], target_port=item["containerPort"])])
     )
     try:
         existing = core.read_namespaced_service(item["serviceName"], item["namespace"])
@@ -160,7 +117,6 @@ def provision_kubernetes(item: dict[str, Any]) -> dict[str, Any]:
             raise
         core.create_namespaced_service(item["namespace"], service)
         service_action = "CREATED"
-
     ingress = networking.read_namespaced_ingress(item["ingressName"], item["namespace"])
     rules = ingress.spec.rules or []
     rule = next((r for r in rules if not item["ingressHost"] or r.host == item["ingressHost"]), None)
@@ -171,48 +127,27 @@ def provision_kubernetes(item: dict[str, Any]) -> dict[str, Any]:
     if any(p.path == path_value for p in rule.http.paths):
         ingress_action = "UNCHANGED"
     else:
-        rule.http.paths.append(client.V1HTTPIngressPath(
-            path=path_value,
-            path_type="ImplementationSpecific",
-            backend=client.V1IngressBackend(service=client.V1IngressServiceBackend(
-                name=item["serviceName"], port=client.V1ServiceBackendPort(number=item["servicePort"])
-            )),
-        ))
+        rule.http.paths.append(client.V1HTTPIngressPath(path=path_value, path_type="ImplementationSpecific", backend=client.V1IngressBackend(service=client.V1IngressServiceBackend(name=item["serviceName"], port=client.V1ServiceBackendPort(number=item["servicePort"])))))
         ingress.spec.rules = rules
         networking.replace_namespaced_ingress(item["ingressName"], item["namespace"], ingress)
         ingress_action = "PATH_ADDED"
     return {"serviceName": item["serviceName"], "serviceAction": service_action, "ingressName": item["ingressName"], "ingressPath": path_value, "ingressAction": ingress_action}
 
-
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "UP", "mode": PROVISION_MODE}
-
-
-@app.post("/api/login")
-def login(body: LoginRequest) -> dict[str, Any]:
-    username = body.username.strip()
-    if not username or not body.password:
-        raise HTTPException(status_code=400, detail="Username and password are required")
-    if body.role == "DEVOPS" and body.password != DEVOPS_PASSWORD:
-        raise HTTPException(status_code=401, detail="Invalid DevOps credentials")
-    user = {"username": username, "role": body.role}
-    return {"token": create_token(username, body.role), "user": user}
-
+    return {"status": "UP", "mode": PROVISION_MODE, "authentication": "ENTRA_ID"}
 
 @app.get("/api/me")
-def me(user: dict[str, str] = Depends(current_user)) -> dict[str, str]:
+def me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     return user
 
-
 @app.get("/api/requests")
-def list_requests(user: dict[str, str] = Depends(current_user)) -> list[dict[str, Any]]:
+def list_requests(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
     items = read_requests()
-    return items if user["role"] == "DEVOPS" else [x for x in items if x["requestedBy"] == user["username"]]
-
+    return items if user["role"] in {"DEVOPS", "ADMIN"} else [x for x in items if x["requestedBy"] == user["username"]]
 
 @app.post("/api/requests", status_code=status.HTTP_201_CREATED)
-def create_request(body: ServiceRequestCreate, user: dict[str, str] = Depends(current_user)) -> dict[str, Any]:
+def create_request(body: ServiceRequestCreate, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     service_name, namespace = safe_name(body.serviceName), safe_name(body.namespace)
     if not service_name or not namespace:
         raise HTTPException(status_code=400, detail="Valid service name and namespace are required")
@@ -221,14 +156,13 @@ def create_request(body: ServiceRequestCreate, user: dict[str, str] = Depends(cu
         raise HTTPException(status_code=409, detail="An active request already exists for this service")
     created = now_iso()
     item = body.model_dump()
-    item.update({"id": str(uuid4()), "serviceName": service_name, "namespace": namespace, "ingressName": safe_name(body.ingressName), "status": "PENDING_APPROVAL", "requestedBy": user["username"], "approvedBy": None, "approvalComment": "", "repositoryUrl": "", "steps": [], "createdAt": created, "updatedAt": created})
+    item.update({"id": str(uuid4()), "serviceName": service_name, "namespace": namespace, "ingressName": safe_name(body.ingressName), "status": "PENDING_APPROVAL", "requestedBy": user["username"], "requestedById": user["id"], "approvedBy": None, "approvalComment": "", "repositoryUrl": "", "steps": [], "createdAt": created, "updatedAt": created})
     items.insert(0, item)
     write_requests(items)
     return item
 
-
 @app.post("/api/requests/{request_id}/reject")
-def reject_request(request_id: str, body: ApprovalRequest, user: dict[str, str] = Depends(require_devops)) -> dict[str, Any]:
+def reject_request(request_id: str, body: ApprovalRequest, user: dict[str, Any] = Depends(require_devops)) -> dict[str, Any]:
     items = read_requests()
     item = next((x for x in items if x["id"] == request_id), None)
     if not item:
@@ -237,9 +171,8 @@ def reject_request(request_id: str, body: ApprovalRequest, user: dict[str, str] 
     write_requests(items)
     return item
 
-
 @app.post("/api/requests/{request_id}/approve")
-async def approve_request(request_id: str, body: ApprovalRequest, user: dict[str, str] = Depends(require_devops)) -> dict[str, Any]:
+async def approve_request(request_id: str, body: ApprovalRequest, user: dict[str, Any] = Depends(require_devops)) -> dict[str, Any]:
     items = read_requests()
     item = next((x for x in items if x["id"] == request_id), None)
     if not item:
