@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM mashrequae.azurecr.io/chatapi-baseimage:v1
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
