@@ -28,11 +28,14 @@ AZDO_PROJECT = os.getenv("AZDO_PROJECT", "")
 AZDO_PAT = os.getenv("AZDO_PAT", "")
 DEVOPS_PASSWORD = os.getenv("DEVOPS_APPROVER_PASSWORD", "devops123")
 
-app = FastAPI(title=APP_TITLE, version="2.1.0")
+app = FastAPI(title=APP_TITLE, version="2.2.0")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 security = HTTPBearer()
 store_lock = Lock()
+
+WORKFLOW_STEPS = ["CREATE_AZURE_REPO", "CREATE_K8S_SERVICE", "UPDATE_INGRESS"]
+TERMINAL_STEP_STATUSES = {"COMPLETED", "REUSED", "SKIPPED"}
 
 
 class LoginRequest(BaseModel):
@@ -59,7 +62,6 @@ class ServiceRequestCreate(BaseModel):
     scheduledJob: bool = False
     prodPodCount: int = Field(default=1, ge=0, le=100)
     comments: dict[str, str] = Field(default_factory=dict)
-
     namespace: str
     description: str = ""
     containerPort: int = Field(default=8080, ge=1, le=65535)
@@ -82,6 +84,10 @@ class ServiceRequestCreate(BaseModel):
 
 class ApprovalRequest(BaseModel):
     comment: str = "Approved"
+
+
+class ResumeRequest(BaseModel):
+    comment: str = "Resume provisioning"
 
 
 def now_iso() -> str:
@@ -141,6 +147,45 @@ def prepare_request(body: ServiceRequestCreate) -> dict[str, Any]:
     return item
 
 
+def ensure_steps(item: dict[str, Any]) -> list[dict[str, Any]]:
+    existing = {step.get("name"): step for step in item.get("steps", []) if step.get("name") in WORKFLOW_STEPS}
+    steps: list[dict[str, Any]] = []
+    for name in WORKFLOW_STEPS:
+        step = existing.get(name) or {
+            "name": name,
+            "status": "PENDING",
+            "retryCount": 0,
+            "startedAt": None,
+            "completedAt": None,
+            "error": "",
+            "details": {},
+        }
+        steps.append(step)
+    item["steps"] = steps
+    return steps
+
+
+def get_step(item: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(step for step in ensure_steps(item) if step["name"] == name)
+
+
+def mark_step_running(step: dict[str, Any]) -> None:
+    step.update({"status": "RUNNING", "startedAt": now_iso(), "completedAt": None, "error": ""})
+
+
+def mark_step_success(step: dict[str, Any], details: dict[str, Any], status_value: str = "COMPLETED") -> None:
+    step.update({"status": status_value, "completedAt": now_iso(), "error": "", "details": details})
+
+
+def mark_step_failed(step: dict[str, Any], exc: Exception) -> None:
+    step.update({
+        "status": "FAILED",
+        "completedAt": now_iso(),
+        "error": str(exc),
+        "retryCount": int(step.get("retryCount", 0)) + 1,
+    })
+
+
 async def create_or_get_repo(name: str) -> dict[str, Any]:
     if PROVISION_MODE != "live":
         return {"url": f"https://dev.azure.com/example/project/_git/{name}", "action": "DRY_RUN"}
@@ -168,12 +213,10 @@ def k8s_clients() -> tuple[client.CoreV1Api, client.NetworkingV1Api]:
     return client.CoreV1Api(), client.NetworkingV1Api()
 
 
-def provision_kubernetes(item: dict[str, Any]) -> dict[str, Any]:
-    path_value = f"{item['ingressPath']}(/|$)(.*)"
+def provision_service(item: dict[str, Any]) -> dict[str, Any]:
     if PROVISION_MODE != "live":
-        return {"serviceAction": "DRY_RUN", "ingressAction": "DRY_RUN", "ingressPath": path_value}
-
-    core, networking = k8s_clients()
+        return {"serviceName": item["serviceName"], "serviceAction": "DRY_RUN"}
+    core, _ = k8s_clients()
     service = client.V1Service(
         metadata=client.V1ObjectMeta(name=item["serviceName"], namespace=item["namespace"], labels={"app": item["serviceName"]}),
         spec=client.V1ServiceSpec(
@@ -190,13 +233,20 @@ def provision_kubernetes(item: dict[str, Any]) -> dict[str, Any]:
         service.spec.ip_families = existing.spec.ip_families
         service.spec.ip_family_policy = existing.spec.ip_family_policy
         core.replace_namespaced_service(item["serviceName"], item["namespace"], service)
-        service_action = "UPDATED_EXISTING"
+        action = "UPDATED_EXISTING"
     except ApiException as exc:
         if exc.status != 404:
             raise
         core.create_namespaced_service(item["namespace"], service)
-        service_action = "CREATED"
+        action = "CREATED"
+    return {"serviceName": item["serviceName"], "serviceAction": action}
 
+
+def provision_ingress(item: dict[str, Any]) -> dict[str, Any]:
+    path_value = f"{item['ingressPath']}(/|$)(.*)"
+    if PROVISION_MODE != "live":
+        return {"ingressName": item["ingressName"], "ingressPath": path_value, "ingressAction": "DRY_RUN"}
+    _, networking = k8s_clients()
     ingress = networking.read_namespaced_ingress(item["ingressName"], item["namespace"])
     rules = ingress.spec.rules or []
     rule = next((r for r in rules if not item["ingressHost"] or r.host == item["ingressHost"]), None)
@@ -205,7 +255,7 @@ def provision_kubernetes(item: dict[str, Any]) -> dict[str, Any]:
         rules.append(rule)
     rule.http.paths = rule.http.paths or []
     if any(p.path == path_value for p in rule.http.paths):
-        ingress_action = "UNCHANGED"
+        action = "UNCHANGED"
     else:
         rule.http.paths.append(client.V1HTTPIngressPath(
             path=path_value,
@@ -216,8 +266,54 @@ def provision_kubernetes(item: dict[str, Any]) -> dict[str, Any]:
         ))
         ingress.spec.rules = rules
         networking.replace_namespaced_ingress(item["ingressName"], item["namespace"], ingress)
-        ingress_action = "PATH_ADDED"
-    return {"serviceName": item["serviceName"], "serviceAction": service_action, "ingressName": item["ingressName"], "ingressPath": path_value, "ingressAction": ingress_action}
+        action = "PATH_ADDED"
+    return {"ingressName": item["ingressName"], "ingressPath": path_value, "ingressAction": action}
+
+
+async def run_workflow(item: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
+    ensure_steps(item)
+    item["status"] = "PROVISIONING"
+    item["updatedAt"] = now_iso()
+    write_requests(items)
+
+    for step_name in WORKFLOW_STEPS:
+        step = get_step(item, step_name)
+        if step.get("status") in TERMINAL_STEP_STATUSES:
+            continue
+        mark_step_running(step)
+        item["updatedAt"] = now_iso()
+        write_requests(items)
+        try:
+            if step_name == "CREATE_AZURE_REPO":
+                details = await create_or_get_repo(item.get("repoName") or item["serviceName"])
+                item["repositoryUrl"] = details["url"]
+                final_status = "REUSED" if details.get("action") == "REUSED_EXISTING" else "COMPLETED"
+                mark_step_success(step, details, final_status)
+            elif step_name == "CREATE_K8S_SERVICE":
+                mark_step_success(step, provision_service(item))
+            elif step_name == "UPDATE_INGRESS":
+                mark_step_success(step, provision_ingress(item))
+            item["updatedAt"] = now_iso()
+            write_requests(items)
+        except Exception as exc:
+            mark_step_failed(step, exc)
+            item["status"] = "FAILED"
+            item["lastError"] = str(exc)
+            item["failedStep"] = step_name
+            item["updatedAt"] = now_iso()
+            write_requests(items)
+            raise HTTPException(status_code=500, detail={
+                "error": str(exc),
+                "failedStep": step_name,
+                "request": item,
+            }) from exc
+
+    item["status"] = "COMPLETED" if PROVISION_MODE == "live" else "DRY_RUN_COMPLETED"
+    item["lastError"] = ""
+    item["failedStep"] = None
+    item["updatedAt"] = now_iso()
+    write_requests(items)
+    return item
 
 
 @app.get("/api/health")
@@ -244,6 +340,8 @@ def me(user: dict[str, str] = Depends(current_user)) -> dict[str, str]:
 @app.get("/api/requests")
 def list_requests(user: dict[str, str] = Depends(current_user)) -> list[dict[str, Any]]:
     items = read_requests()
+    for item in items:
+        ensure_steps(item)
     return items if user["role"] == "DEVOPS" else [x for x in items if x["requestedBy"] == user["username"]]
 
 
@@ -254,7 +352,21 @@ def create_request(body: ServiceRequestCreate, user: dict[str, str] = Depends(cu
     if any(x.get("repoName", x.get("serviceName")) == prepared["repoName"] and x["status"] not in {"REJECTED", "FAILED"} for x in items):
         raise HTTPException(status_code=409, detail="An active request already exists for this repository")
     created = now_iso()
-    prepared.update({"id": str(uuid4()), "status": "PENDING_APPROVAL", "requestedBy": user["username"], "approvedBy": None, "lastEditedBy": None, "approvalComment": "", "repositoryUrl": "", "steps": [], "createdAt": created, "updatedAt": created})
+    prepared.update({
+        "id": str(uuid4()),
+        "status": "PENDING_APPROVAL",
+        "requestedBy": user["username"],
+        "approvedBy": None,
+        "lastEditedBy": None,
+        "approvalComment": "",
+        "repositoryUrl": "",
+        "steps": [],
+        "lastError": "",
+        "failedStep": None,
+        "createdAt": created,
+        "updatedAt": created,
+    })
+    ensure_steps(prepared)
     items.insert(0, prepared)
     write_requests(items)
     return prepared
@@ -269,7 +381,7 @@ def update_request(request_id: str, body: ServiceRequestCreate, user: dict[str, 
     if item["status"] not in {"PENDING_APPROVAL", "FAILED"}:
         raise HTTPException(status_code=409, detail="Only pending or failed requests can be edited")
     prepared = prepare_request(body)
-    preserved = {key: item.get(key) for key in ("id", "status", "requestedBy", "approvedBy", "approvalComment", "repositoryUrl", "steps", "createdAt")}
+    preserved = {key: item.get(key) for key in ("id", "status", "requestedBy", "approvedBy", "approvalComment", "repositoryUrl", "steps", "lastError", "failedStep", "createdAt")}
     item.clear()
     item.update(prepared)
     item.update(preserved)
@@ -298,22 +410,18 @@ async def approve_request(request_id: str, body: ApprovalRequest, user: dict[str
         raise HTTPException(status_code=404, detail="Request not found")
     if item["status"] not in {"PENDING_APPROVAL", "FAILED"}:
         raise HTTPException(status_code=409, detail="Request cannot be approved in its current status")
-    item.update({"status": "PROVISIONING", "approvedBy": user["username"], "approvalComment": body.comment or "Approved", "steps": [], "updatedAt": now_iso()})
-    write_requests(items)
-    try:
-        repo = await create_or_get_repo(item.get("repoName") or item["serviceName"])
-        item["repositoryUrl"] = repo["url"]
-        item["steps"].append({"name": "CREATE_AZURE_REPO", "status": "COMPLETED", "details": repo})
-        write_requests(items)
-        cluster = provision_kubernetes(item)
-        item["steps"].append({"name": "CREATE_K8S_SERVICE_AND_UPDATE_INGRESS", "status": "COMPLETED", "details": cluster})
-        item["status"] = "COMPLETED" if PROVISION_MODE == "live" else "DRY_RUN_COMPLETED"
-        item["updatedAt"] = now_iso()
-        write_requests(items)
-        return item
-    except Exception as exc:
-        item["status"] = "FAILED"
-        item["steps"].append({"name": "PROVISIONING", "status": "FAILED", "error": str(exc)})
-        item["updatedAt"] = now_iso()
-        write_requests(items)
-        raise HTTPException(status_code=500, detail={"error": str(exc), "request": item}) from exc
+    item.update({"approvedBy": user["username"], "approvalComment": body.comment or "Approved", "updatedAt": now_iso()})
+    return await run_workflow(item, items)
+
+
+@app.post("/api/requests/{request_id}/resume")
+async def resume_request(request_id: str, body: ResumeRequest, user: dict[str, str] = Depends(require_devops)) -> dict[str, Any]:
+    items = read_requests()
+    item = next((x for x in items if x["id"] == request_id), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if item["status"] != "FAILED":
+        raise HTTPException(status_code=409, detail="Only failed requests can be resumed")
+    item["approvalComment"] = body.comment or item.get("approvalComment") or "Resume provisioning"
+    item["approvedBy"] = user["username"]
+    return await run_workflow(item, items)
