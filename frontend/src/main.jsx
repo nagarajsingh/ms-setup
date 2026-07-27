@@ -1,6 +1,6 @@
 import React, {useEffect, useMemo, useState} from 'react';
 import {createRoot} from 'react-dom/client';
-import {CheckCircle2, ChevronDown, ChevronUp, Edit3, GitBranch, Globe2, Headphones, Keyboard, LogOut, Plus, Save, Server, X, XCircle} from 'lucide-react';
+import {AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, Edit3, GitBranch, Globe2, Headphones, Keyboard, LogOut, Plus, RotateCcw, Save, Server, X, XCircle} from 'lucide-react';
 import './styles.css';
 
 const API_BASE = import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? '/api' : '/ms-setup-backend/api');
@@ -9,7 +9,11 @@ const api = async (path, options={}) => {
   const token = localStorage.getItem('token');
   const response = await fetch(`${API_BASE}${path}`,{...options,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{}) ,...(options.headers||{})}});
   const data = await response.json().catch(()=>({}));
-  if(!response.ok) throw new Error(typeof data.detail==='string'?data.detail:(data.detail?.error||data.error||'Request failed'));
+  if(!response.ok) {
+    const error = new Error(typeof data.detail==='string'?data.detail:(data.detail?.error||data.error||'Request failed'));
+    error.payload = data.detail || data;
+    throw error;
+  }
   return data;
 };
 
@@ -28,6 +32,12 @@ const templateRows = [
   ['environments','Environments'],['ingressPath','Ingress (App Endpoint)'],['securityStage','Security Stage'],
   ['scheduledJob','Scheduled Job'],['prodPodCount','No. of Pods in Prod']
 ];
+
+const stepLabels = {
+  CREATE_AZURE_REPO:'Azure DevOps Repository',
+  CREATE_K8S_SERVICE:'Kubernetes Service',
+  UPDATE_INGRESS:'Ingress Update'
+};
 
 const displayValue = (item,key) => {
   const value = item?.[key];
@@ -89,12 +99,42 @@ function Preview({item}){
   </div>;
 }
 
+function WorkflowStatus({item}){
+  const steps=item.steps||[];
+  return <div className="workflow-panel">
+    <h4>Provisioning workflow</h4>
+    {steps.map(step=><div className={`workflow-step ${step.status.toLowerCase()}`} key={step.name}>
+      <div className="step-icon">{['COMPLETED','REUSED','SKIPPED'].includes(step.status)?<CheckCircle2 size={18}/>:step.status==='FAILED'?<XCircle size={18}/>:<RotateCcw size={18}/>}</div>
+      <div className="step-copy"><strong>{stepLabels[step.name]||step.name}</strong><span>{step.status.replaceAll('_',' ')}</span>{step.error&&<small>{step.error}</small>}{step.status==='REUSED'&&<small>Repository already existed and was reused.</small>}</div>
+    </div>)}
+  </div>;
+}
+
+function ResultModal({result,onClose,onResume,busy}){
+  if(!result)return null;
+  const request=result.request||result;
+  const repoStep=request.steps?.find(s=>s.name==='CREATE_AZURE_REPO');
+  const isFailure=Boolean(result.error||request.status==='FAILED');
+  return <div className="modal-backdrop"><section className="card result-modal">
+    <div className="result-icon">{isFailure?<AlertTriangle size={34}/>:<CheckCircle2 size={34}/>}</div>
+    <h2>{isFailure?'Provisioning stopped':'Provisioning completed'}</h2>
+    {repoStep?.status==='REUSED'&&<div className="notice">Repo is already created. Existing repository was reused.</div>}
+    {isFailure&&<div className="error"><strong>{stepLabels[result.failedStep||request.failedStep]||'Provisioning'} failed.</strong><br/>{result.error||request.lastError}</div>}
+    <WorkflowStatus item={request}/>
+    <div className="form-actions">
+      <button className="ghost" onClick={onClose}>Close</button>
+      {isFailure&&<button onClick={()=>onResume(request.id)} disabled={busy}><RotateCcw size={16}/> Resume provisioning</button>}
+    </div>
+  </section></div>;
+}
+
 function App(){
   const [user,setUser]=useState(JSON.parse(localStorage.getItem('user')||'null'));
   const [items,setItems]=useState([]); const [error,setError]=useState(''); const [busy,setBusy]=useState(false);
   const [login,setLogin]=useState({username:'',password:'',role:'DEVELOPER'});
   const [form,setForm]=useState({...emptyForm,comments:{}});
   const [expanded,setExpanded]=useState(null); const [editing,setEditing]=useState(null); const [editForm,setEditForm]=useState(null);
+  const [result,setResult]=useState(null);
   const load=()=>api('/requests').then(setItems).catch(e=>setError(e.message));
   useEffect(()=>{if(user) load();},[user]);
   const signIn=async e=>{e.preventDefault();setError('');try{const r=await api('/login',{method:'POST',body:JSON.stringify(login)});localStorage.setItem('token',r.token);localStorage.setItem('user',JSON.stringify(r.user));setUser(r.user);}catch(e){setError(e.message)}};
@@ -103,7 +143,8 @@ function App(){
   const submit=async e=>{e.preventDefault();setBusy(true);setError('');try{const body=payload(form);body.ingressPath=body.ingressPath.endsWith('/')?`${body.ingressPath}${body.repoName}`:body.ingressPath;await api('/requests',{method:'POST',body:JSON.stringify(body)});setForm({...emptyForm,comments:{}});await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
   const saveEdit=async e=>{e.preventDefault();setBusy(true);setError('');try{await api(`/requests/${editing}`,{method:'PUT',body:JSON.stringify(payload(editForm))});setEditing(null);setEditForm(null);await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
   const beginEdit=item=>{setEditing(item.id);setEditForm({...emptyForm,...item,environments:Array.isArray(item.environments)?item.environments.join(', '):(item.environments||''),comments:item.comments||{}})};
-  const act=async(id,kind)=>{setBusy(true);setError('');try{await api(`/requests/${id}/${kind}`,{method:'POST',body:JSON.stringify({comment:kind==='approve'?'Approved by DevOps':'Rejected by DevOps'})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
+  const provision=async(id,kind)=>{setBusy(true);setError('');try{const response=await api(`/requests/${id}/${kind}`,{method:'POST',body:JSON.stringify({comment:kind==='approve'?'Approved by DevOps':'Resume provisioning'})});setResult(response);await load();}catch(e){setResult(e.payload||{error:e.message});await load();}finally{setBusy(false)}};
+  const reject=async id=>{setBusy(true);setError('');try{await api(`/requests/${id}/reject`,{method:'POST',body:JSON.stringify({comment:'Rejected by DevOps'})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
   const requestCount=useMemo(()=>items.length,[items]);
 
   if(!user)return <main className="login-shell">
@@ -130,12 +171,14 @@ function App(){
       {items.length===0?<p className="muted">No requests found.</p>:items.map(x=><article key={x.id} className="request-card">
         <div className="request-summary"><div><h3>{x.repoName||x.serviceName}</h3><p>{x.requestedBy} · {x.namespace} · {x.ingressPath}</p><span className={`status ${x.status.toLowerCase()}`}>{x.status}</span></div>
           <div className="actions">{x.repositoryUrl&&<a href={x.repositoryUrl} target="_blank" rel="noreferrer">Repository</a>}<button className="ghost" onClick={()=>setExpanded(expanded===x.id?null:x.id)}>{expanded===x.id?<ChevronUp size={16}/>:<ChevronDown size={16}/>} Preview</button>
-          {user.role==='DEVOPS'&&['PENDING_APPROVAL','FAILED'].includes(x.status)&&<><button className="secondary" onClick={()=>beginEdit(x)}><Edit3 size={16}/> Edit</button><button onClick={()=>act(x.id,'approve')} disabled={busy}><CheckCircle2 size={16}/> Approve</button><button className="danger" onClick={()=>act(x.id,'reject')} disabled={busy}><XCircle size={16}/> Reject</button></>}</div></div>
-        {expanded===x.id&&<Preview item={x}/>} {x.steps?.length>0&&expanded===x.id&&<pre>{JSON.stringify(x.steps,null,2)}</pre>}
+          {user.role==='DEVOPS'&&x.status==='PENDING_APPROVAL'&&<><button className="secondary" onClick={()=>beginEdit(x)}><Edit3 size={16}/> Edit</button><button onClick={()=>provision(x.id,'approve')} disabled={busy}><CheckCircle2 size={16}/> Approve</button><button className="danger" onClick={()=>reject(x.id)} disabled={busy}><XCircle size={16}/> Reject</button></>}
+          {user.role==='DEVOPS'&&x.status==='FAILED'&&<><button className="secondary" onClick={()=>beginEdit(x)}><Edit3 size={16}/> Edit</button><button onClick={()=>provision(x.id,'resume')} disabled={busy}><RotateCcw size={16}/> Resume</button></>}</div></div>
+        {expanded===x.id&&<><Preview item={x}/><WorkflowStatus item={x}/></>}
       </article>)}
     </section>
   </main>
   {editing&&<div className="modal-backdrop"><section className="card modal"><div className="modal-title"><div><h2>Edit onboarding request</h2><p className="muted">Review and correct details before approval.</p></div><button className="icon ghost" onClick={()=>setEditing(null)}><X/></button></div><RequestForm value={editForm} setValue={setEditForm} onSubmit={saveEdit} busy={busy} submitLabel="Save changes" onCancel={()=>setEditing(null)}/></section></div>}
+  <ResultModal result={result} onClose={()=>setResult(null)} onResume={id=>provision(id,'resume')} busy={busy}/>
   </>;
 }
 
