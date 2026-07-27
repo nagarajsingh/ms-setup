@@ -1,6 +1,6 @@
 import React, {useEffect, useMemo, useState} from 'react';
 import {createRoot} from 'react-dom/client';
-import {CheckCircle2, ChevronDown, ChevronUp, Edit3, GitBranch, LogOut, Plus, Save, Server, ShieldCheck, X, XCircle} from 'lucide-react';
+import {CheckCircle2, ChevronDown, ChevronUp, Edit3, GitBranch, Globe2, Headphones, Keyboard, LogOut, Plus, Save, Server, X, XCircle} from 'lucide-react';
 import './styles.css';
 
 const API_BASE = import.meta.env.VITE_API_BASE || (import.meta.env.DEV ? '/api' : '/ms-setup-backend/api');
@@ -35,6 +35,13 @@ const displayValue = (item,key) => {
   if(typeof value==='boolean') return value?'Yes':'No';
   return value===0?'0':(value||'—');
 };
+
+function Brand({compact=false}){
+  return <div className={`mashreq-brand ${compact?'compact':''}`}>
+    <div className="brand-line"><span className="mashreq-word">mashreq</span><span className="brand-mark" aria-hidden="true">✦</span><span className="arabic-word">المشرق</span></div>
+    <div className="neo-line"><span>NEO</span><strong>CORP</strong></div>
+  </div>;
+}
 
 function RequestForm({value,setValue,onSubmit,busy,submitLabel='Submit request',onCancel}){
   const set = (key,val)=>setValue({...value,[key]:val});
@@ -99,9 +106,24 @@ function App(){
   const act=async(id,kind)=>{setBusy(true);setError('');try{await api(`/requests/${id}/${kind}`,{method:'POST',body:JSON.stringify({comment:kind==='approve'?'Approved by DevOps':'Rejected by DevOps'})});await load();}catch(e){setError(e.message)}finally{setBusy(false)}};
   const requestCount=useMemo(()=>items.length,[items]);
 
-  if(!user)return <main className="login"><section className="card login-card"><div className="brand"><ShieldCheck/><div><h1>MS Setup</h1><p>Microservice provisioning portal</p></div></div>{error&&<div className="error">{error}</div>}<form onSubmit={signIn}><label>Username<input value={login.username} onChange={e=>setLogin({...login,username:e.target.value})} required/></label><label>Password<input type="password" value={login.password} onChange={e=>setLogin({...login,password:e.target.value})} required/></label><label>Role<select value={login.role} onChange={e=>setLogin({...login,role:e.target.value})}><option>DEVELOPER</option><option>DEVOPS</option></select></label><button>Sign in</button></form></section></main>;
+  if(!user)return <main className="login-shell">
+    <div className="login-topbar"><span><Globe2 size={18}/> English <ChevronDown size={15}/></span><span><Headphones size={19}/> Customer Care</span></div>
+    <div className="wave wave-one"/><div className="wave wave-two"/><div className="skyline" aria-hidden="true"/>
+    <section className="login-panel">
+      <Brand/>
+      <div className="login-copy"><h1>Microservice Setup</h1><p>Developer onboarding and provisioning portal</p></div>
+      {error&&<div className="error">{error}</div>}
+      <form onSubmit={signIn}>
+        <label>User ID<div className="input-with-icon"><input value={login.username} onChange={e=>setLogin({...login,username:e.target.value})} required/><Keyboard size={25}/></div></label>
+        <label>Password<input type="password" value={login.password} onChange={e=>setLogin({...login,password:e.target.value})} required/></label>
+        <label>Role<select value={login.role} onChange={e=>setLogin({...login,role:e.target.value})}><option>DEVELOPER</option><option>DEVOPS</option></select></label>
+        <button className="continue-button" disabled={busy}>{busy?'Signing in…':'Continue'}</button>
+      </form>
+      <div className="login-footer"><strong>Microservice Onboarding / Self Service</strong><span>Azure DevOps, Kubernetes and Database Provisioning</span></div>
+    </section>
+  </main>;
 
-  return <><header><div className="brand"><Server/><div><h1>Microservice Setup</h1><p>Azure DevOps + Kubernetes automation</p></div></div><div className="user"><span>{user.username} · {user.role}</span><button className="ghost" onClick={logout}><LogOut size={17}/> Logout</button></div></header>
+  return <><header><Brand compact/><div className="portal-title"><Server/><div><h1>Microservice Setup</h1><p>Azure DevOps + Kubernetes automation</p></div></div><div className="user"><span>{user.username} · {user.role}</span><button className="ghost" onClick={logout}><LogOut size={17}/> Logout</button></div></header>
   <main className="page">{error&&<div className="error">{error}</div>}
     {user.role==='DEVELOPER'&&<section className="card onboarding-card"><h2><Plus/> New onboarding request</h2><RequestForm value={form} setValue={setForm} onSubmit={submit} busy={busy}/></section>}
     <section className="card requests"><div className="requests-title"><h2><GitBranch/> {user.role==='DEVOPS'?'DevOps approval portal':'My requests'}</h2><span className="count">{requestCount}</span></div>
