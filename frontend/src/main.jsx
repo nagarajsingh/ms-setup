@@ -159,12 +159,12 @@ function App(){
   const requestCount=useMemo(()=>items.length,[items]);
 
   if(!user)return <main className="login-shell"><div className="login-topbar"><span><Globe2 size={18}/> English <ChevronDown size={15}/></span><span><Headphones size={19}/> Customer Care</span></div><div className="wave wave-one"/><div className="wave wave-two"/><div className="skyline" aria-hidden="true"/>
-    <section className="login-panel"><Brand/><div className="login-copy"><h1>Microservice Setup</h1><p>Developer onboarding and provisioning portal</p></div>{error&&<div className="error">{error}</div>}
+    <section className="login-panel"><Brand/><div className="login-copy"><h1>NeoCorp MS Setup Portal</h1><p>Automated Microservice Onboarding &amp; Infrastructure Provisioning</p></div>{error&&<div className="error">{error}</div>}
       <form onSubmit={signIn}><label>User ID<div className="input-with-icon"><input value={login.username} onChange={e=>setLogin({...login,username:e.target.value})} required/><Keyboard size={25}/></div></label><label>Password<input type="password" value={login.password} onChange={e=>setLogin({...login,password:e.target.value})} required/></label><label>Role<select value={login.role} onChange={e=>setLogin({...login,role:e.target.value})}><option>DEVELOPER</option><option>DEVOPS</option></select></label><button className="continue-button" disabled={busy}>{busy?'Signing in…':'Continue'}</button></form>
       <div className="login-footer"><strong>Microservice Onboarding / Self Service</strong><span>Azure DevOps, Kubernetes and Database Provisioning</span></div></section></main>;
 
   const cardActions={userRole:user.role,busy,expanded,setExpanded,beginEdit,provision,reject};
-  return <><header><Brand compact/><div className="portal-title"><Server/><div><h1>Microservice Setup</h1><p>Azure DevOps + Kubernetes automation</p></div></div><div className="user"><span>{user.username} · {user.role}</span><button className="ghost" onClick={logout}><LogOut size={17}/> Logout</button></div></header>
+  return <><header><Brand compact/><div className="portal-title"><Server/><div><h1>NeoCorp MS Setup Portal</h1><p>Automated Microservice Onboarding &amp; Infrastructure Provisioning</p></div></div><div className="user"><span>{user.username} · {user.role}</span><button className="ghost" onClick={logout}><LogOut size={17}/> Logout</button></div></header>
     <main className="page">{error&&<div className="error">{error}</div>}
       {user.role==='DEVOPS' ? (devopsView==='dashboard'?<DevOpsDashboard items={items} onOpen={view=>{setExpanded(null);setDevopsView(view)}}/>:<DevOpsCategory category={devopsView} items={items} {...cardActions} onBack={()=>{setExpanded(null);setDevopsView('dashboard')}}/>) : <>
         <section className="card onboarding-card"><h2><Plus/> New onboarding request</h2><RequestForm value={form} setValue={setForm} onSubmit={submit} busy={busy}/></section>
